@@ -76,6 +76,13 @@ associated with the requesting language server."
   :group 'lsp-semantic-tokens
   :type 'boolean)
 
+(defcustom lsp-semantic-tokens-hide-stale-highlights nil
+  "When set to t, semantic tokens pertaining to a previous version of the current document will be ignored during highlighting.
+This avoids potentially incorrect highlights, but at the cost of flashes
+during editing operations."
+  :group 'lsp-semantic-tokens
+  :type 'boolean)
+
 (defface lsp-face-semhl-constant
   '((t :inherit font-lock-constant-face))
   "Face used for semantic highlighting scopes matching constant scopes."
@@ -487,77 +494,96 @@ given workspace/language-server combination.
 This cache should be flushed every time any modifier
 configuration changes.")
 
+(defun lsp--semantic-tokens-fontify-from-cache (tokens end)
+  "Apply semantic TOKENS from point to END."
+  (when-let ((faces (seq-some #'lsp--workspace-semantic-tokens-faces lsp--buffer-workspaces))
+             (modifier-faces
+              (when lsp-semantic-tokens-apply-modifiers
+                (seq-some #'lsp--workspace-semantic-tokens-modifier-faces lsp--buffer-workspaces))))
+    (-let* ((inhibit-field-text-motion t)
+            (i0 0)
+            (i-max (1- (length tokens)))
+            (current-line 1)
+            (line-delta)
+            (column 0)
+            (face)
+            (face-or-faces)
+            (beg)
+            (line-start-pos)
+            (line-min)
+            (text-property-beg)
+            (text-property-end))
+      ;; TODO: do we need to save mark and excursion within function-type font-lock keywords?
+      (save-restriction
+        (widen)
+        (setq line-min (line-number-at-pos))
+        (setq beg (point))
+        (with-silent-modifications
+          (let ((skip-lines (- line-min current-line)))
+            (while (and (<= i0 i-max) (< (aref tokens i0) skip-lines))
+              (setq skip-lines (- skip-lines (aref tokens i0)))
+              (setq i0 (+ i0 5)))
+            (setq current-line (- line-min skip-lines)))
+          (forward-line (- current-line line-min))
+          (setq line-start-pos (point))
+          (cl-loop
+           for i from i0 to i-max by 5 do
+           (setq line-delta (aref tokens i))
+           (unless (= line-delta 0)
+             (forward-line line-delta)
+             (setq line-start-pos (point))
+             (setq column 0)
+             (setq current-line (+ current-line line-delta)))
+           (setq column (+ column (aref tokens (1+ i))))
+           (setq face (aref faces (aref tokens (+ i 3))))
+           (setq text-property-beg (+ line-start-pos column))
+           (setq text-property-end
+                 (min (if lsp-semantic-tokens-enable-multiline-token-support
+                          (point-max) (line-end-position))
+                      (+ text-property-beg (aref tokens (+ i 2)))))
+           (unless (< text-property-beg beg)
+             ;; Deal with modifiers. We cache common combinations of
+             ;; modifiers, storing the faces they resolve to.
+             (let* ((modifier-code (aref tokens (+ i 4)))
+                    (modifier-faces (gethash modifier-code semantic-token-modifier-cache 'not-found)))
+               (when (eq 'not-found modifier-faces)
+                 (setq modifier-faces nil)
+                 (cl-loop for j from 0 to (1- (length modifier-faces)) do
+                          (when (and (aref modifier-faces j)
+                                     (> (logand modifier-code (ash 1 j)) 0))
+                            (push (aref modifier-faces j) modifier-faces)))
+                 (puthash modifier-code modifier-faces semantic-token-modifier-cache))
+               (setq face-or-faces (if (not modifier-faces) face
+                                     (if (not face) modifier-faces
+                                       (cons face modifier-faces))))
+               (add-face-text-property text-property-beg text-property-end face-or-faces)
+               (unless lsp-semantic-tokens-hide-stale-highlights
+                 (put-text-property text-property-beg text-property-end 'lsp-semantic-tokens-faces face-or-faces))))
+           when (>= (point) end) return nil))))))
+
+(defun lsp--semantic-tokens-fontify-stale (end)
+  "Re-apply current semantic token highlights from point to END."
+  (save-restriction
+    (widen)
+    (save-mark-and-excursion
+      (unless (get-text-property (point) 'lsp-semantic-tokens-faces)
+        ;; make sure we start on top of a previously fontified fragment, or beyond END
+        (goto-char (or (next-single-property-change (point) 'lsp-semantic-tokens-faces nil end) (1+ end))))
+      (let (prop-end face-or-faces)
+        (while (< (point) end)
+          (setq face-or-faces (get-text-property (point) 'lsp-semantic-tokens-faces))
+          (setq prop-end (next-single-property-change (point) 'lsp-semantic-tokens-faces nil end))
+          (when prop-end (add-face-text-property (point) prop-end face-or-faces))
+          (goto-char (or prop-end (1+ end))))))))
+
 (defun lsp--semantic-tokens-fontify (end)
   "Apply semantic tokens from point to END."
   ;; TODO: support multiple language servers per buffer?
-  (let ((faces (seq-some #'lsp--workspace-semantic-tokens-faces lsp--buffer-workspaces))
-        (modifier-faces
-         (when lsp-semantic-tokens-apply-modifiers
-           (seq-some #'lsp--workspace-semantic-tokens-modifier-faces lsp--buffer-workspaces))))
-    (unless (or (eq nil faces)
-                (eq nil lsp--semantic-tokens-cache)
-                (eq nil (plist-get lsp--semantic-tokens-cache :response))
-                ;; NOTE: perhaps we'd rather have stale highlights than temporarily dropping them altogether?
-                (not (= lsp--cur-version (plist-get lsp--semantic-tokens-cache :_documentVersion))))
-      
-      (-let* ((inhibit-field-text-motion t)
-              (data (lsp-get (plist-get lsp--semantic-tokens-cache :response) :data))
-              (i0 0)
-              (i-max (1- (length data)))
-              (current-line 1)
-              (line-delta)
-              (column 0)
-              (face)
-              (beg)
-              (line-start-pos)
-              (line-min)
-              (text-property-beg)
-              (text-property-end))
-        ;; TODO: do we need to save mark and excursion within function-type font-lock keywords?
-        (save-restriction
-          (widen)
-          (setq line-min (line-number-at-pos))
-          (setq beg (point))
-          (with-silent-modifications
-            (let ((skip-lines (- line-min current-line)))
-              (while (and (<= i0 i-max) (< (aref data i0) skip-lines))
-                (setq skip-lines (- skip-lines (aref data i0)))
-                (setq i0 (+ i0 5)))
-              (setq current-line (- line-min skip-lines)))
-            (forward-line (- current-line line-min))
-            (setq line-start-pos (point))
-            (cl-loop
-             for i from i0 to i-max by 5 do
-             (setq line-delta (aref data i))
-             (unless (= line-delta 0)
-               (forward-line line-delta)
-               (setq line-start-pos (point))
-               (setq column 0)
-               (setq current-line (+ current-line line-delta)))
-             (setq column (+ column (aref data (1+ i))))
-             (setq face (aref faces (aref data (+ i 3))))
-             (setq text-property-beg (+ line-start-pos column))
-             (setq text-property-end
-                   (min (if lsp-semantic-tokens-enable-multiline-token-support
-                            (point-max) (line-end-position))
-                        (+ text-property-beg (aref data (+ i 2)))))
-             (unless (< text-property-beg beg)
-               (when face
-                 (put-text-property text-property-beg text-property-end 'face face))
-               ;; Deal with modifiers. We cache common combinations of
-               ;; modifiers, storing the faces they resolve to.
-               (let* ((modifier-code (aref data (+ i 4)))
-                      (faces-to-apply (gethash modifier-code semantic-token-modifier-cache 'not-found)))
-                 (when (eq 'not-found faces-to-apply)
-                   (setq faces-to-apply nil)
-                   (cl-loop for j from 0 to (1- (length modifier-faces)) do
-                            (when (and (aref modifier-faces j)
-                                       (> (logand modifier-code (ash 1 j)) 0))
-                              (push (aref modifier-faces j) faces-to-apply)))
-                   (puthash modifier-code faces-to-apply semantic-token-modifier-cache))
-                 (dolist (face faces-to-apply)
-                   (add-face-text-property text-property-beg text-property-end face))))
-             when (>= (point) end) return nil)))))))
+  (when lsp--semantic-tokens-cache
+    (if (not (= lsp--cur-version (plist-get lsp--semantic-tokens-cache :_documentVersion)))
+        (unless lsp-semantic-tokens-hide-stale-highlights (lsp--semantic-tokens-fontify-stale end))
+      (lsp--semantic-tokens-fontify-from-cache
+       (lsp-get (plist-get lsp--semantic-tokens-cache :response) :data) end))))
 
 (defun lsp-semantic-tokens--request-update ()
   "Request semantic-tokens update."
@@ -574,19 +600,18 @@ configuration changes.")
   "Return plist of token-types and token-modifiers defined by WORKSPACE,
 or nil if none are defined."
   (when-let* ((token-capabilities
-              (or
-               (-some->
-                   (lsp--registered-capability "textDocument/semanticTokens")
-                 (lsp--registered-capability-options))
-               (lsp:server-capabilities-semantic-tokens-provider?
-                (lsp--workspace-server-capabilities workspace)))))
+               (or
+                (-some->
+                    (lsp--registered-capability "textDocument/semanticTokens")
+                  (lsp--registered-capability-options))
+                (lsp:server-capabilities-semantic-tokens-provider?
+                 (lsp--workspace-server-capabilities workspace)))))
     (-let* (((&SemanticTokensOptions :legend) token-capabilities))
       `(:token-types ,(lsp:semantic-tokens-legend-token-types legend)
         :token-modifiers ,(lsp:semantic-tokens-legend-token-modifiers legend)))))
 
 (defun lsp-semantic-tokens-suggest-overrides ()
-  "Suggest face overrides that best match the faces
-chosen by `font-lock-fontify-region'."
+  "Suggest face overrides that best match the faces chosen by `font-lock-fontify-region'."
   (interactive)
   (-when-let* ((token-info (-some #'lsp--semantic-tokens-as-defined-by-workspace lsp--buffer-workspaces))
                ((&plist :token-types token-types :token-modifiers token-modifiers) token-info))

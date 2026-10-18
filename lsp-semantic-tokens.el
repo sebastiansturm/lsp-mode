@@ -496,6 +496,8 @@ configuration changes.")
 
 (defun lsp--semantic-tokens-fontify-from-cache (tokens end)
   "Apply semantic TOKENS from point to END."
+  (unless lsp-semantic-tokens-hide-stale-highlights
+    (put-text-property (point) end 'lsp-semantic-tokens-faces nil))
   (when-let ((faces (seq-some #'lsp--workspace-semantic-tokens-faces lsp--buffer-workspaces))
              (modifier-faces
               (when lsp-semantic-tokens-apply-modifiers
